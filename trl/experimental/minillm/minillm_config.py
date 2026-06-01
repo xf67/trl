@@ -34,16 +34,23 @@ class MiniLLMConfig(GRPOConfig):
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model.
         rkl_advantage (`bool`, *optional*, defaults to `True`):
-            Whether to add the reverse KL advantage to the reward advantage.
+            Whether to use the reverse-KL future advantage term in pure OPD training.
         single_step_decomposition (`bool`, *optional*, defaults to `True`):
             Whether to use single-step decomposition for the KL divergence computation.
         kd_temperature (`float`, *optional*, defaults to `1.0`):
             Temperature for knowledge distillation. Higher temperatures produce softer probability distributions over
             classes.
+        teacher_mixin_alpha (`float`, *optional*, defaults to `0.0`):
+            Mixing coefficient for the rollout distribution used in MiniLLM. The trainer samples tokens from
+            `teacher_mixin_alpha * p_teacher + (1 - teacher_mixin_alpha) * q_student`, following the paper. Set to
+            `0.0` to keep the original TRL pure-student rollout behavior.
+        teacher_mixin_importance_clip (`float`, *optional*, defaults to `10.0`):
+            Maximum importance weight applied to the single-step MiniLLM term during teacher-mixed training. If set to
+            `None`, no clipping is applied.
         gamma (`float`, *optional*, defaults to `0.0`):
-            Discount factor for future rewards in reinforcement learning.
+            Discount factor applied to future reverse-KL rewards when computing the OPD advantage.
         length_normalization (`bool`, *optional*, defaults to `True`):
-            Whether to apply length normalization to the rewards.
+            Whether to normalize the reverse-KL future advantage by the remaining response length.
     """
 
     _VALID_DICT_FIELDS = GRPOConfig._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -61,7 +68,7 @@ class MiniLLMConfig(GRPOConfig):
     )
     rkl_advantage: bool = field(
         default=True,
-        metadata={"help": "Whether to add the reverse KL advantage to the reward advantage."},
+        metadata={"help": "Whether to use the reverse-KL future advantage term in pure OPD training."},
     )
     single_step_decomposition: bool = field(
         default=True,
@@ -74,13 +81,24 @@ class MiniLLMConfig(GRPOConfig):
             "distributions over classes."
         },
     )
+    teacher_mixin_alpha: float = field(
+        default=0.0,
+        metadata={
+            "help": "Mixing coefficient for the rollout distribution teacher_mixin_alpha * p_teacher + "
+            "(1 - teacher_mixin_alpha) * q_student."
+        },
+    )
+    teacher_mixin_importance_clip: float | None = field(
+        default=10.0,
+        metadata={"help": "Maximum importance weight for the teacher-mixed single-step MiniLLM loss."},
+    )
     gamma: float = field(
         default=0.0,
-        metadata={"help": "Discount factor for future rewards in reinforcement learning."},
+        metadata={"help": "Discount factor applied to future reverse-KL rewards in the OPD advantage."},
     )
     length_normalization: bool = field(
         default=True,
-        metadata={"help": "Whether to apply length normalization to the rewards."},
+        metadata={"help": "Whether to normalize the reverse-KL future advantage by the remaining response length."},
     )
 
     def __post_init__(self):
@@ -91,6 +109,11 @@ class MiniLLMConfig(GRPOConfig):
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
         if self.num_generations == 1:
             self.scale_rewards = "none"
+
+        if self.teacher_mixin_alpha < 0.0 or self.teacher_mixin_alpha > 1.0:
+            raise ValueError("teacher_mixin_alpha must be in the range [0.0, 1.0].")
+        if self.teacher_mixin_importance_clip is not None and self.teacher_mixin_importance_clip <= 0.0:
+            raise ValueError("teacher_mixin_importance_clip must be greater than 0 when provided.")
 
         num_processes = self.world_size
         # The current default effective batch size

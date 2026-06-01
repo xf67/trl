@@ -63,7 +63,6 @@ def parse_args():
         "--teacher-model-path",
         default=os.environ.get("TEACHER_MODEL_PATH", "/home/xxf/models/Qwen3-30B-A3B"),
     )
-    parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
     parser.add_argument("--teacher-mixin-alphas", default=os.environ.get("TEACHER_MIXIN_ALPHAS", "0.0,0.2"))
     parser.add_argument("--seed", default=os.environ.get("SEED", "42"))
     parser.add_argument("--smoke", action="store_true")
@@ -77,7 +76,6 @@ def main():
     env = os.environ.copy()
     env["TRL_EXPERIMENTAL_SILENCE"] = env.get("TRL_EXPERIMENTAL_SILENCE", "1")
     env["HF_ENDPOINT"] = env.get("HF_ENDPOINT", "https://hf-mirror.com")
-    env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     env["MODEL_PATH"] = args.student_model_path
     env["TEACHER_MODEL_PATH"] = args.teacher_model_path
     env["TEACHER_MIXIN_ALPHAS"] = args.teacher_mixin_alphas
@@ -97,7 +95,6 @@ def main():
     print("Key environment:")
     for key in [
         "HF_ENDPOINT",
-        "CUDA_VISIBLE_DEVICES",
         "MODEL_PATH",
         "TEACHER_MODEL_PATH",
         "TEACHER_MIXIN_ALPHAS",
@@ -113,6 +110,7 @@ def main():
         "SEED",
     ]:
         print(f"{key}={env[key]}")
+    print(f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<inherited-unset>')}")
     print()
 
     raise SystemExit(subprocess.run(command, cwd=REPO_DIR, env=env).returncode)

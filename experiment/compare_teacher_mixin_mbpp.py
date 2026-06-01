@@ -1,4 +1,5 @@
 import ast
+import gc
 import json
 import os
 import random
@@ -362,9 +363,19 @@ def run_variant(
         "train_runtime": train_metrics.get("train_runtime"),
     }
 
+    accelerator = trainer.accelerator
+    del student_pretrain
+    del teacher_eval
+    del student_posttrain
+    del train_result
+    del train_metrics
     del trainer
+    gc.collect()
+    accelerator.free_memory()
+    del accelerator
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     return result
 
 

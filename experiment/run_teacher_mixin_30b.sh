@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+CUDA_DEVICE="${CUDA_DEVICE:-0}"
+DATASET="${DATASET:-mbpp}"
+CONDA_ENV="${CONDA_ENV:-distill}"
+
+MODEL_PATH="${MODEL_PATH:-/home/xxf/models/Qwen3.5-0.8B-Base}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/home/xxf/models/Qwen3-30B-A3B}"
+HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+TRL_EXPERIMENTAL_SILENCE="${TRL_EXPERIMENTAL_SILENCE:-1}"
+SEED="${SEED:-42}"
+
+MAX_STEPS="${MAX_STEPS:-20}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
+NUM_GENERATIONS="${NUM_GENERATIONS:-1}"
+MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-160}"
+EVAL_GENERATION_BATCH_SIZE="${EVAL_GENERATION_BATCH_SIZE:-1}"
+EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-192}"
+EVAL_TIMEOUT_SECONDS="${EVAL_TIMEOUT_SECONDS:-3}"
+
+if [[ "$DATASET" == "mbpp" ]]; then
+  SCRIPT="experiment/compare_teacher_mixin_mbpp.py"
+  TRAIN_SIZE="${TRAIN_SIZE:-96}"
+  EVAL_SIZE="${EVAL_SIZE:-100}"
+elif [[ "$DATASET" == "humaneval" ]]; then
+  SCRIPT="experiment/compare_teacher_mixin_humaneval.py"
+  TRAIN_SIZE="${TRAIN_SIZE:-96}"
+  EVAL_SIZE="${EVAL_SIZE:-48}"
+else
+  echo "Unsupported DATASET=$DATASET. Use mbpp or humaneval." >&2
+  exit 1
+fi
+
+run_alpha() {
+  local alpha="$1"
+  echo
+  echo "=== Running dataset=$DATASET alpha=$alpha on CUDA_VISIBLE_DEVICES=$CUDA_DEVICE ==="
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" \
+  HF_ENDPOINT="$HF_ENDPOINT" \
+  TRL_EXPERIMENTAL_SILENCE="$TRL_EXPERIMENTAL_SILENCE" \
+  MODEL_PATH="$MODEL_PATH" \
+  TEACHER_MODEL_PATH="$TEACHER_MODEL_PATH" \
+  TEACHER_MIXIN_ALPHAS="$alpha" \
+  SEED="$SEED" \
+  TRAIN_SIZE="$TRAIN_SIZE" \
+  EVAL_SIZE="$EVAL_SIZE" \
+  MAX_STEPS="$MAX_STEPS" \
+  PER_DEVICE_TRAIN_BATCH_SIZE="$PER_DEVICE_TRAIN_BATCH_SIZE" \
+  NUM_GENERATIONS="$NUM_GENERATIONS" \
+  MAX_COMPLETION_LENGTH="$MAX_COMPLETION_LENGTH" \
+  EVAL_GENERATION_BATCH_SIZE="$EVAL_GENERATION_BATCH_SIZE" \
+  EVAL_MAX_NEW_TOKENS="$EVAL_MAX_NEW_TOKENS" \
+  EVAL_TIMEOUT_SECONDS="$EVAL_TIMEOUT_SECONDS" \
+  conda run -n "$CONDA_ENV" python "$SCRIPT"
+}
+
+echo "Root: $ROOT_DIR"
+echo "Dataset: $DATASET"
+echo "CUDA_VISIBLE_DEVICES: $CUDA_DEVICE"
+echo "Student: $MODEL_PATH"
+echo "Teacher: $TEACHER_MODEL_PATH"
+echo "Script: $SCRIPT"
+
+run_alpha "0.0"
+run_alpha "0.2"

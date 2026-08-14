@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import sys
+from functools import partial
 
 import torch
 
@@ -12,6 +13,34 @@ from .minillm_config import MiniLLMConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+class EagerVLLMInitForDeterminism:
+    """Force colocated vLLM initialization to be eager while PyTorch determinism is enabled."""
+
+    def __init__(self, enabled: bool, deterministic: bool):
+        self.enabled = enabled
+        self.deterministic = deterministic
+        self.vllm_generation = None
+        self.original_llm = None
+
+    def __enter__(self) -> None:
+        if not self.enabled or not (self.deterministic or torch.are_deterministic_algorithms_enabled()):
+            return
+
+        # VLLMGeneration imports LLM into its own module namespace. Patch that reference only while GRPOTrainer
+        # creates the colocated engine, then restore it so this MiniLLM-specific workaround does not affect other
+        # trainers.
+        from ...generation import vllm_generation
+
+        self.vllm_generation = vllm_generation
+        self.original_llm = vllm_generation.LLM
+        vllm_generation.LLM = partial(self.original_llm, enforce_eager=True)
+        logger.info("PyTorch deterministic algorithms are enabled; initializing colocated vLLM in eager mode.")
+
+    def __exit__(self, *args) -> None:
+        if self.vllm_generation is not None:
+            self.vllm_generation.LLM = self.original_llm
 
 
 class TeacherVLLM:

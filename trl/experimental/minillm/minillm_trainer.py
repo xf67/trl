@@ -34,7 +34,7 @@ from ...trainer.grpo_trainer import GRPOTrainer, RewardFunc, RolloutFunc
 from ...trainer.utils import disable_dropout_in_model, get_config_model_id
 from ..utils import empty_cache
 from .minillm_config import MiniLLMConfig
-from .vllm_helper import TeacherVLLM
+from .vllm_helper import EagerVLLMInitForDeterminism, TeacherVLLM
 
 
 if is_peft_available():
@@ -222,19 +222,21 @@ class MiniLLMTrainer(GRPOTrainer):
                 # ensure Transformers resolves the original config and model classes.
                 teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
 
-        super().__init__(
-            model,
-            reward_funcs,
-            args=args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            reward_processing_classes=reward_processing_classes,
-            callbacks=callbacks,
-            optimizers=optimizers,
-            peft_config=peft_config,
-            rollout_func=rollout_func,
-        )
+        use_eager_student_vllm = args.use_vllm and args.vllm_mode == "colocate"
+        with EagerVLLMInitForDeterminism(use_eager_student_vllm, deterministic=args.full_determinism):
+            super().__init__(
+                model,
+                reward_funcs,
+                args=args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                processing_class=processing_class,
+                reward_processing_classes=reward_processing_classes,
+                callbacks=callbacks,
+                optimizers=optimizers,
+                peft_config=peft_config,
+                rollout_func=rollout_func,
+            )
 
         self.teacher_vllm = None
         if args.use_vllm_teacher:

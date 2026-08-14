@@ -4,8 +4,18 @@ set -euo pipefail
 export CUDA_HOME=/home/xxf/anaconda3/envs/distill92/lib/python3.12/site-packages/nvidia/cu13
 export PATH=/home/xxf/anaconda3/envs/distill92/lib/python3.12/site-packages/nvidia/cu13/bin:$PATH
 
+export PYTHONHASHSEED=42
+FULL_DETERMINISM=${FULL_DETERMINISM:-true}
+if [[ "$FULL_DETERMINISM" == "true" ]]; then
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
+    export FLASH_ATTENTION_DETERMINISTIC=1
+    export CUDA_LAUNCH_BLOCKING=1
+else
+    unset CUBLAS_WORKSPACE_CONFIG FLASH_ATTENTION_DETERMINISTIC CUDA_LAUNCH_BLOCKING
+fi
+
 REPO_DIR=/home/xxf/Distill/trl
-OUTPUT_DIR=/home/xxf/Distill/Qbitwise/Qwen3.5-0.8B-Base-MiniLLM-stu1fix0-tea1
+OUTPUT_DIR=/home/xxf/Distill/Qbitwise/Qwen3.5-0.8B-Base-MiniLLM
 PYTHON=/home/xxf/anaconda3/envs/distill92/bin/python
 
 mkdir -p "$OUTPUT_DIR"
@@ -19,8 +29,9 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 \
     --output_dir "$OUTPUT_DIR" \
     --dtype bfloat16 \
     --bf16 true \
+    --full_determinism "$FULL_DETERMINISM" \
     --use_vllm true \
-    --use-vllm-teacher true \
+    --use-vllm-teacher false \
     --teacher_vllm_gpu_memory_utilization 0.4 \
     --vllm_enable_sleep_mode true \
     --vllm_importance_sampling_correction false \

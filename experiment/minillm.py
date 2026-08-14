@@ -4,11 +4,12 @@
 For a complete local launch example, use `examples/scripts/run_minillm_vllm.sh`.
 """
 
+import os
 from dataclasses import dataclass, field
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, set_seed
 
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config, get_quantization_config
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
@@ -27,6 +28,8 @@ class MiniLLMScriptArguments(ScriptArguments):
 if __name__ == "__main__":
     parser = TrlParser((MiniLLMScriptArguments, MiniLLMConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    training_args.seed = int(os.environ.get("PYTHONHASHSEED", str(training_args.seed)))
+    set_seed(training_args.seed)
 
     if model_args.model_name_or_path is None:
         raise ValueError("model_name_or_path must be provided.")

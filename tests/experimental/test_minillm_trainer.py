@@ -17,12 +17,47 @@ import torch
 from datasets import DatasetDict, load_dataset
 
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
+from trl.experimental.minillm.vllm_helper import EagerVLLMInitForDeterminism
 
 from ..testing_utils import TrlTestCase
 
 
 @pytest.mark.low_priority
 class TestMiniLLMTrainer(TrlTestCase):
+    def test_deterministic_vllm_init_uses_eager_mode_and_restores_llm(self, monkeypatch):
+        calls = []
+
+        def fake_llm(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        from trl.generation import vllm_generation
+
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+        monkeypatch.setattr(vllm_generation, "LLM", fake_llm, raising=False)
+
+        with EagerVLLMInitForDeterminism(enabled=True, deterministic=True):
+            vllm_generation.LLM("student-model", seed=42)
+
+        assert calls == [(("student-model",), {"enforce_eager": True, "seed": 42})]
+        assert vllm_generation.LLM is fake_llm
+
+    def test_nondeterministic_vllm_init_preserves_default_mode(self, monkeypatch):
+        calls = []
+
+        def fake_llm(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        from trl.generation import vllm_generation
+
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+        monkeypatch.setattr(vllm_generation, "LLM", fake_llm, raising=False)
+
+        with EagerVLLMInitForDeterminism(enabled=True, deterministic=False):
+            vllm_generation.LLM("student-model", seed=42)
+
+        assert calls == [(("student-model",), {"seed": 42})]
+        assert vllm_generation.LLM is fake_llm
+
     def test_train(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 

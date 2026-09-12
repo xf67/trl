@@ -34,6 +34,10 @@ class MiniLLMConfig(GRPOConfig):
         use_vllm_teacher (`bool`, *optional*, defaults to `False`):
             Whether to use an automatically managed vLLM server for teacher scoring. `use_vllm` retains its
             [`~trl.GRPOConfig`] meaning and controls only student completion generation.
+        vllm_share_student_weights (`bool`, *optional*, defaults to `False`):
+            Whether the colocated student vLLM model and Transformers training model should use the same physical
+            Qwen3.5 parameter storage. The first-stage implementation supports only single-process TP=1 full training
+            with the native, non-quantized vLLM model.
         teacher_vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.2`):
             GPU memory utilization for the teacher vLLM engine automatically managed by the trainer when
             `use_vllm_teacher=True`.
@@ -68,6 +72,12 @@ class MiniLLMConfig(GRPOConfig):
     use_vllm_teacher: bool = field(
         default=False,
         metadata={"help": "Whether to use an automatically managed vLLM server for teacher scoring."},
+    )
+    vllm_share_student_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Share Qwen3.5 parameter storage between the Transformers student and colocated student vLLM."
+        },
     )
     teacher_vllm_gpu_memory_utilization: float = field(
         default=0.2,
@@ -143,6 +153,16 @@ class MiniLLMConfig(GRPOConfig):
             raise ValueError("teacher_vllm_gpu_memory_utilization must be in the range (0, 1].")
         if self.teacher_vllm_server_timeout <= 0:
             raise ValueError("teacher_vllm_server_timeout must be positive.")
+
+        if self.vllm_share_student_weights:
+            if not self.use_vllm:
+                raise ValueError("vllm_share_student_weights=True requires use_vllm=True.")
+            if self.vllm_mode != "colocate":
+                raise ValueError("vllm_share_student_weights=True requires vllm_mode='colocate'.")
+            if self.vllm_tensor_parallel_size != 1:
+                raise ValueError("vllm_share_student_weights=True currently requires vllm_tensor_parallel_size=1.")
+            if self.vllm_model_impl != "vllm":
+                raise ValueError("vllm_share_student_weights=True currently requires vllm_model_impl='vllm'.")
 
         num_processes = self.world_size
         # The current default effective batch size

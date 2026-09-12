@@ -15,7 +15,7 @@ else
 fi
 
 REPO_DIR=/home/xxf/Distill/trl
-OUTPUT_DIR=/home/xxf/Distill/Qbitwise/Qwen3.5-0.8B-Base-MiniLLM
+OUTPUT_DIR=/home/xxf/Distill/Qbitwise/Qwen3.5-0.8B-Base-MiniLLM-share
 PYTHON=/home/xxf/anaconda3/envs/distill92/bin/python
 
 mkdir -p "$OUTPUT_DIR"
@@ -31,6 +31,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 \
     --bf16 true \
     --full_determinism "$FULL_DETERMINISM" \
     --use_vllm true \
+    --vllm_share_student_weights true \
     --use-vllm-teacher false \
     --teacher_vllm_gpu_memory_utilization 0.4 \
     --vllm_enable_sleep_mode true \
@@ -44,4 +45,5 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 \
     --logging_steps 1 \
     --save_steps 200 \
     --report_to tensorboard \
+    --vllm_enable_sleep_mode false \
     2>&1 | tee "$OUTPUT_DIR/trainer.log"

@@ -16,16 +16,19 @@ logger = logging.getLogger(__name__)
 
 
 class EagerVLLMInitForDeterminism:
-    """Force colocated vLLM initialization to be eager while PyTorch determinism is enabled."""
+    """Force colocated vLLM initialization to be eager when required by MiniLLM."""
 
-    def __init__(self, enabled: bool, deterministic: bool):
+    def __init__(self, enabled: bool, deterministic: bool, force: bool = False):
         self.enabled = enabled
         self.deterministic = deterministic
+        self.force = force
         self.vllm_generation = None
         self.original_llm = None
 
     def __enter__(self) -> None:
-        if not self.enabled or not (self.deterministic or torch.are_deterministic_algorithms_enabled()):
+        if not self.enabled or not (
+            self.force or self.deterministic or torch.are_deterministic_algorithms_enabled()
+        ):
             return
 
         # VLLMGeneration imports LLM into its own module namespace. Patch that reference only while GRPOTrainer
@@ -36,7 +39,10 @@ class EagerVLLMInitForDeterminism:
         self.vllm_generation = vllm_generation
         self.original_llm = vllm_generation.LLM
         vllm_generation.LLM = partial(self.original_llm, enforce_eager=True)
-        logger.info("PyTorch deterministic algorithms are enabled; initializing colocated vLLM in eager mode.")
+        if self.force:
+            logger.info("Initializing colocated vLLM in eager mode because virtual student weights are enabled.")
+        else:
+            logger.info("PyTorch deterministic algorithms are enabled; initializing colocated vLLM in eager mode.")
 
     def __exit__(self, *args) -> None:
         if self.vllm_generation is not None:

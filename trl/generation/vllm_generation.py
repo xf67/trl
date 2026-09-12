@@ -287,6 +287,7 @@ class VLLMGeneration:
         self.max_completion_length = max_completion_length
         self.logprobs = logprobs
         self.generation_kwargs = generation_kwargs or {}
+        self.virtual_weight_store = None
 
         self._init_vllm()
 
@@ -448,6 +449,11 @@ class VLLMGeneration:
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
         """
+        if self.virtual_weight_store is not None:
+            self.virtual_weight_store.publish()
+            self.llm.reset_prefix_cache()
+            return
+
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
         # management (e.g., Ascend NPU). See https://github.com/huggingface/trl/issues/5142
@@ -502,6 +508,20 @@ class VLLMGeneration:
             self.vllm_client.reset_prefix_cache()
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
+
+    def install_virtual_weight_store(self, store) -> None:
+        """Use a colocated weight store whose tensors are already bound to the vLLM model."""
+        if self.mode != "colocate":
+            raise ValueError("Virtual weights require vllm_mode='colocate'.")
+        if self.virtual_weight_store is not None:
+            raise RuntimeError("A virtual weight store is already installed.")
+
+        self.virtual_weight_store = store
+        self.virtual_weight_store.publish()
+        if self.enable_sleep_mode:
+            self.llm.sleep(level=2)
+        # Shared weights live outside vLLM's sleep allocator and remain resident after level-2 sleep.
+        self._llm_weights_sleeping = False
 
     def generate(
         self,
@@ -677,6 +697,9 @@ class VLLMGeneration:
             with profiler:
                 all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
 
+            if self.virtual_weight_store is not None:
+                self.virtual_weight_store.finish_generation()
+
             all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
             all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
             all_logprobs, all_logprob_token_ids = extract_logprobs(all_outputs)
@@ -698,6 +721,6 @@ class VLLMGeneration:
 
             if self.enable_sleep_mode:
                 self.llm.sleep(level=2)
-                self._llm_weights_sleeping = True
+                self._llm_weights_sleeping = self.virtual_weight_store is None
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids

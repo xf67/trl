@@ -31,11 +31,10 @@ from transformers.utils import is_peft_available
 
 from ...models import prepare_deepspeed
 from ...trainer.grpo_trainer import GRPOTrainer, RewardFunc, RolloutFunc
-from ...trainer.utils import disable_dropout_in_model, get_config_model_id
+from ...trainer.utils import get_config_model_id
 from ..utils import empty_cache
 from .minillm_config import MiniLLMConfig
-from .virtual_weights import Qwen35VirtualWeightStore
-from .vllm_helper import EagerVLLMInitForDeterminism, TeacherVLLM
+from .vllm_helper import EagerVLLMInitForDeterminism, TeacherVLLM, VirtualWeightVLLMInit
 
 
 if is_peft_available():
@@ -227,10 +226,9 @@ class MiniLLMTrainer(GRPOTrainer):
             raise ValueError("vllm_share_student_weights=True does not support PEFT yet.")
 
         use_eager_student_vllm = args.use_vllm and args.vllm_mode == "colocate"
-        with EagerVLLMInitForDeterminism(
-            use_eager_student_vllm,
-            deterministic=args.full_determinism,
-            force=args.vllm_share_student_weights,
+        with (
+            EagerVLLMInitForDeterminism(use_eager_student_vllm, deterministic=args.full_determinism),
+            VirtualWeightVLLMInit(enabled=args.vllm_share_student_weights),
         ):
             super().__init__(
                 model,
@@ -253,13 +251,8 @@ class MiniLLMTrainer(GRPOTrainer):
             if self.is_deepspeed_enabled or self.is_fsdp_enabled:
                 raise ValueError("vllm_share_student_weights=True does not support DeepSpeed or FSDP yet.")
 
-            # Sleep level 2 initially discarded vLLM's private weight allocation. Wake it once so both loaded model
-            # namespaces can be validated and rebound; all subsequent optimizer-to-vLLM publishes are zero-copy.
-            self.vllm_generation.sync_weights()
-            vllm_model = self.vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            self.virtual_weight_store = Qwen35VirtualWeightStore.bind(self.model, vllm_model)
-            self.vllm_generation.install_virtual_weight_store(self.virtual_weight_store)
-            empty_cache()
+            self.virtual_weight_store = self.vllm_generation.virtual_weight_store
+            self.virtual_weight_store.validate_aliases()
 
         self.teacher_vllm = None
         if args.use_vllm_teacher:

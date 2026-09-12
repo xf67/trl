@@ -5,7 +5,8 @@ export CUDA_HOME=/home/xxf/anaconda3/envs/distill92/lib/python3.12/site-packages
 export PATH=/home/xxf/anaconda3/envs/distill92/lib/python3.12/site-packages/nvidia/cu13/bin:$PATH
 
 export PYTHONHASHSEED=42
-FULL_DETERMINISM=${FULL_DETERMINISM:-true}
+FULL_DETERMINISM=${FULL_DETERMINISM:-false}
+VLLM_ENABLE_SLEEP_MODE=${VLLM_ENABLE_SLEEP_MODE:-false}
 if [[ "$FULL_DETERMINISM" == "true" ]]; then
     export CUBLAS_WORKSPACE_CONFIG=:4096:8
     export FLASH_ATTENTION_DETERMINISTIC=1
@@ -34,7 +35,6 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 \
     --vllm_share_student_weights true \
     --use-vllm-teacher false \
     --teacher_vllm_gpu_memory_utilization 0.4 \
-    --vllm_enable_sleep_mode true \
     --vllm_importance_sampling_correction false \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
@@ -45,5 +45,5 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} PYTHONUNBUFFERED=1 \
     --logging_steps 1 \
     --save_steps 200 \
     --report_to tensorboard \
-    --vllm_enable_sleep_mode false \
+    --vllm_enable_sleep_mode "${VLLM_ENABLE_SLEEP_MODE:-false}" \
     2>&1 | tee "$OUTPUT_DIR/trainer.log"

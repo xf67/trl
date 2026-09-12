@@ -70,12 +70,23 @@ class Qwen35VirtualWeightStore:
         arenas: list[torch.Tensor],
         bindings: list[_WeightBinding],
         resident_buffers: list[_ResidentBuffer],
+        hf_model: nn.Module,
+        vllm_model: nn.Module,
     ):
         self.arenas = arenas
         self.bindings = bindings
         self.resident_buffers = resident_buffers
         self._bindings_by_hf_name = {binding.hf_name: binding for binding in bindings}
         self.device = bindings[0].hf_param.device
+        self.hf_model = hf_model
+        self.vllm_model = vllm_model
+        self._hf_layouts = {binding.hf_name: self._layout(binding.hf_param) for binding in bindings}
+        self._vllm_layouts = {binding.vllm_name: self._layout(binding.vllm_param) for binding in bindings}
+        self._buffer_layouts = {item.name: self._layout(item.buffer) for item in resident_buffers}
+
+    @staticmethod
+    def _layout(tensor: torch.Tensor) -> tuple:
+        return tensor.data_ptr(), tensor.shape, tensor.stride(), tensor.dtype, tensor.device
 
     @classmethod
     def _map_hf_name(cls, name: str) -> tuple[str, int | None]:
@@ -94,8 +105,9 @@ class Qwen35VirtualWeightStore:
         return vllm_name, None
 
     @classmethod
+    @torch.inference_mode(False)
     def bind(cls, hf_model: nn.Module, vllm_model: nn.Module) -> "Qwen35VirtualWeightStore":
-        """Build shared storages and bind the two already-loaded model objects to them."""
+        """Bind loaded models before vLLM profiling/capture, allocating ordinary tensors usable by autograd."""
         config = hf_model.config
         if config.model_type != "qwen3_5":
             raise ValueError(
@@ -180,7 +192,7 @@ class Qwen35VirtualWeightStore:
                 buffer.data = storage
                 resident_buffers.append(_ResidentBuffer(name, buffer, storage))
 
-        store = cls(arenas, bindings, resident_buffers)
+        store = cls(arenas, bindings, resident_buffers, hf_model, vllm_model)
         store.validate_aliases()
         shared_bytes = sum(param.numel() * param.element_size() for param in vllm_params.values())
         logger.info(
@@ -224,16 +236,27 @@ class Qwen35VirtualWeightStore:
             )
 
     def validate_aliases(self) -> None:
-        """Fail if a model move or assigning checkpoint load replaced one side's storage."""
+        """Check current module objects and the addresses/layouts fixed before graph capture."""
+        hf_params = dict(self.hf_model.named_parameters())
+        vllm_params = dict(self.vllm_model.named_parameters())
         for binding in self.bindings:
-            vllm_view = binding.vllm_view()
-            if binding.hf_param.data_ptr() != vllm_view.data_ptr():
+            if (
+                hf_params.get(binding.hf_name) is not binding.hf_param
+                or vllm_params.get(binding.vllm_name) is not binding.vllm_param
+                or self._layout(binding.hf_param) != self._hf_layouts[binding.hf_name]
+                or self._layout(binding.vllm_param) != self._vllm_layouts[binding.vllm_name]
+                or binding.hf_param.data_ptr() != binding.vllm_view().data_ptr()
+            ):
                 raise RuntimeError(
                     f"Virtual weight alias for {binding.hf_name!r} -> {binding.vllm_name!r} was broken. "
                     "Do not move either model or load a state dict with assign=True after binding."
                 )
+        buffers = dict(self.vllm_model.named_buffers())
         for resident_buffer in self.resident_buffers:
-            if resident_buffer.buffer.data_ptr() != resident_buffer.storage.data_ptr():
+            if (
+                buffers.get(resident_buffer.name) is not resident_buffer.buffer
+                or self._layout(resident_buffer.buffer) != self._buffer_layouts[resident_buffer.name]
+            ):
                 raise RuntimeError(
                     f"Resident vLLM buffer {resident_buffer.name!r} was replaced after virtual-weight binding."
                 )

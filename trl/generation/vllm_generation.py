@@ -369,8 +369,8 @@ class VLLMGeneration:
             )
             if self.enable_sleep_mode:
                 self.llm.sleep(level=2)
-            # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
-            self._llm_weights_sleeping = self.enable_sleep_mode
+            # Shared weights remain resident; only private weights need reloading after level-2 sleep.
+            self._llm_weights_sleeping = self.enable_sleep_mode and self.virtual_weight_store is None
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -671,7 +671,9 @@ class VLLMGeneration:
                 all_images = images
 
             if self.enable_sleep_mode:
-                self.llm.wake_up(tags=["kv_cache"])
+                # Shared weights are resident, but vLLM's scheduler resumes only after both sleep tags are awake.
+                tags = ["weights", "kv_cache"] if self.virtual_weight_store is not None else ["kv_cache"]
+                self.llm.wake_up(tags=tags)
 
             # Build vLLM-compatible prompt inputs with token IDs and optional multi-modal data
             vllm_prompts = []

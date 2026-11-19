@@ -18,6 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, s
 from trl.experimental.gkd import GKDConfig, GKDTrainer
 
 from bf16_stochastic_adamw import BF16StochasticAdamW
+from cpu_offload_adamw import CPUOffloadBF16StochasticAdamW
 
 
 EXPERIMENT_ROOT = Path(__file__).resolve().parent
@@ -37,12 +38,33 @@ parser.add_argument("--model-root", type=Path, default=DEFAULT_MODEL_ROOT)
 parser.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
 parser.add_argument("--fixed-rollouts", type=Path, default=DEFAULT_FIXED_ROLLOUTS)
 parser.add_argument("--output-root", type=Path, default=EXPERIMENT_ROOT / "results")
+parser.add_argument(
+    "--dataset",
+    type=Path,
+    default=None,
+    help="Open-MOPD parquet with `prompt` and `domain`; uses the first steps * batch-size rows that fit, in file "
+    "order, instead of --coverage",
+)
+parser.add_argument("--batch-size", type=int, default=1)
+parser.add_argument("--max-prompt-length", type=int, default=512)
+parser.add_argument("--max-new-tokens", type=int, default=1024)
+parser.add_argument("--max-length", type=int, default=1536)
+parser.add_argument(
+    "--loss-chunk-size", type=int, default=None, help="completion tokens per loss chunk; default: dense logits"
+)
+parser.add_argument("--gradient-checkpointing", action="store_true")
+parser.add_argument("--cpu-adam", action="store_true", help="keep AdamW moments and update arithmetic on the CPU")
+parser.add_argument("--cpu-threads", type=int, default=8)
 cli = parser.parse_args()
 if cli.steps <= 0 or not 0 <= cli.warmup < cli.steps:
     parser.error("require steps > 0 and 0 <= warmup < steps")
+if cli.batch_size <= 0 or cli.max_prompt_length + cli.max_new_tokens > cli.max_length:
+    parser.error("require batch-size > 0 and max-prompt-length + max-new-tokens <= max-length")
+if cli.mode == "fixed" and (cli.batch_size != 1 or cli.dataset is not None):
+    parser.error("fixed mode replays the batch-size-1 coverage rollouts")
 
 
-torch.set_num_threads(8)
+torch.set_num_threads(cli.cpu_threads)
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 set_seed(42)
@@ -51,6 +73,7 @@ run = cli.output_root / f"gkd-{cli.mode}-bf16-{cli.steps}-{time.strftime('%Y%m%d
 run.mkdir(parents=True)
 shutil.copy2(__file__, run / "train.py")
 shutil.copy2(EXPERIMENT_ROOT / "bf16_stochastic_adamw.py", run / "bf16_stochastic_adamw.py")
+shutil.copy2(EXPERIMENT_ROOT / "cpu_offload_adamw.py", run / "cpu_offload_adamw.py")
 print("RUN_DIR", run, flush=True)
 
 
@@ -63,15 +86,16 @@ def clock():
     return time.perf_counter()
 
 
-coverage_file = cli.coverage.resolve()
-coverage = json.loads(coverage_file.read_text())["samples"]
-for index, row in enumerate(coverage):
-    if row["teacher_id"] != index % len(TEACHER_NAMES):
-        raise ValueError("coverage rows must route Math, Code, IF in order")
-    if not 0 < len(row["input_ids"]) <= 512:
-        raise ValueError("coverage prompt length must be in [1, 512]")
-    row["sample_id"] = index
-dataset = Dataset.from_list(coverage)
+coverage_file = cli.coverage.resolve() if cli.dataset is None else None
+if coverage_file is not None:
+    coverage = json.loads(coverage_file.read_text())["samples"]
+    for index, row in enumerate(coverage):
+        if row["teacher_id"] != index % len(TEACHER_NAMES):
+            raise ValueError("coverage rows must route Math, Code, IF in order")
+        if not 0 < len(row["input_ids"]) <= cli.max_prompt_length:
+            raise ValueError(f"coverage prompt length must be in [1, {cli.max_prompt_length}]")
+        row["sample_id"] = index
+    dataset = Dataset.from_list(coverage)
 
 fixed_rollouts = None
 if cli.mode == "fixed":
@@ -96,6 +120,32 @@ def load_model(name, trainable):
 student, tokenizer = load_model("MixSFT", trainable=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
+
+dataset_file = cli.dataset.resolve() if cli.dataset is not None else None
+if dataset_file is not None:
+    import pyarrow.parquet as pq
+
+    domain_ids = {name.lower(): teacher_id for teacher_id, name in enumerate(TEACHER_NAMES)}
+    needed = cli.steps * cli.batch_size
+    selected = []
+    skipped_long = 0
+    for batch in pq.ParquetFile(dataset_file).iter_batches(batch_size=1024, columns=["prompt", "domain"]):
+        for row in batch.to_pylist():
+            index = len(selected) + skipped_long
+            text = tokenizer.apply_chat_template(list(row["prompt"]), tokenize=False, add_generation_prompt=True)
+            input_ids = tokenizer(text, add_special_tokens=False).input_ids
+            if not 0 < len(input_ids) <= cli.max_prompt_length:
+                skipped_long += 1
+                continue
+            selected.append({"input_ids": input_ids, "teacher_id": domain_ids[row["domain"]], "sample_id": index})
+            if len(selected) == needed:
+                break
+        if len(selected) == needed:
+            break
+    if len(selected) < needed:
+        raise ValueError(f"{dataset_file} has only {len(selected)} prompts within {cli.max_prompt_length} tokens")
+    dataset = Dataset.from_list(selected)
+    print(f"DATASET first {needed} prompts within budget, skipped {skipped_long} longer ones", flush=True)
 teacher_models = {}
 for teacher_id, name in enumerate(TEACHER_NAMES):
     teacher_models[teacher_id], teacher_tokenizer = load_model(name, trainable=False)
@@ -198,12 +248,12 @@ class Monitor(TrainerCallback):
 monitor = Monitor()
 training_args = GKDConfig(
     output_dir=str(run / "checkpoint"),
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
+    per_device_train_batch_size=cli.batch_size,
+    per_device_eval_batch_size=cli.batch_size,
     gradient_accumulation_steps=1,
     max_steps=cli.steps,
-    max_length=1536,
-    max_new_tokens=1024,
+    max_length=cli.max_length,
+    max_new_tokens=cli.max_new_tokens,
     learning_rate=1e-6,
     weight_decay=0.01,
     max_grad_norm=1.0,
@@ -216,7 +266,8 @@ training_args = GKDConfig(
     seed=42,
     bf16=True,
     fp16=False,
-    gradient_checkpointing=False,
+    gradient_checkpointing=cli.gradient_checkpointing,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     logging_steps=1,
     logging_nan_inf_filter=False,
     save_strategy="no",
@@ -231,13 +282,18 @@ trainer = OrderedTrainer(
     processing_class=tokenizer,
     data_collator=collate,
     callbacks=[monitor],
+    loss_chunk_size=cli.loss_chunk_size,
 )
 student.to(dtype=torch.bfloat16)
-student.gradient_checkpointing_disable()
-if student.is_gradient_checkpointing:
-    raise RuntimeError("gradient checkpointing must remain disabled")
+if cli.gradient_checkpointing:
+    student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+else:
+    student.gradient_checkpointing_disable()
+if student.is_gradient_checkpointing != cli.gradient_checkpointing:
+    raise RuntimeError("gradient checkpointing state does not match --gradient-checkpointing")
 trainer.model_accepts_loss_kwargs = False
-trainer.optimizer = BF16StochasticAdamW(
+optimizer_class = CPUOffloadBF16StochasticAdamW if cli.cpu_adam else BF16StochasticAdamW
+trainer.optimizer = optimizer_class(
     student.parameters(), lr=1e-6, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, foreach=False
 )
 trainer.generation_config.use_cache = True
@@ -257,12 +313,21 @@ config = {
     "steps": cli.steps,
     "warmup": cli.warmup,
     "model_root": str(cli.model_root.resolve()),
-    "coverage": str(coverage_file),
-    "coverage_sha256": hashlib.sha256(coverage_file.read_bytes()).hexdigest(),
+    "coverage": str(coverage_file) if coverage_file is not None else None,
+    "coverage_sha256": hashlib.sha256(coverage_file.read_bytes()).hexdigest() if coverage_file is not None else None,
+    "dataset": str(dataset_file) if dataset_file is not None else None,
+    "sample_ids": dataset["sample_id"],
+    "batch_size": cli.batch_size,
+    "max_prompt_length": cli.max_prompt_length,
+    "max_new_tokens": cli.max_new_tokens,
+    "max_length": cli.max_length,
+    "loss_chunk_size": cli.loss_chunk_size,
+    "cpu_adam": cli.cpu_adam,
+    "cpu_threads": cli.cpu_threads,
     "fixed_rollouts": str(cli.fixed_rollouts.resolve()) if cli.mode == "fixed" else None,
     "student": "MixSFT",
     "teachers": list(TEACHER_NAMES),
-    "teacher_order": [row["teacher_id"] for row in coverage],
+    "teacher_order": dataset["teacher_id"],
     "versions": {
         package: importlib.metadata.version(package) for package in ("torch", "transformers", "trl", "accelerate")
     },
@@ -276,7 +341,8 @@ config = {
     "parameter_dtypes": sorted({str(parameter.dtype) for parameter in student.parameters()}),
     "accelerator_mixed_precision": trainer.accelerator.mixed_precision,
     "effective_optimizer": {
-        "class": "BF16StochasticAdamW",
+        "class": optimizer_class.__name__,
+        "state_device": "cpu" if cli.cpu_adam else "cuda",
         "source": str(optimizer_file),
         "source_sha256": hashlib.sha256(optimizer_file.read_bytes()).hexdigest(),
         "lr": 1e-6,
@@ -316,7 +382,8 @@ for teacher_id, teacher in teachers.items():
     teacher.to = measured_to
 
     def observe_teacher(module, args, kwargs, _teacher_id=teacher_id):
-        if trainer._active_teacher_id != _teacher_id or trainer.teacher_model is not module:
+        # Hooked on the decoder, which both the dense and the chunked loss paths run.
+        if trainer._active_teacher_id != _teacher_id or trainer.teacher_model is not teachers[_teacher_id]:
             raise RuntimeError("the active teacher does not match teacher_id")
         if module.training or torch.is_grad_enabled():
             raise RuntimeError("teachers must run in eval/no-grad mode")
@@ -326,7 +393,7 @@ for teacher_id, teacher in teachers.items():
                 raise RuntimeError("exactly one teacher must reside on CUDA")
         teacher_calls[_teacher_id] += 1
 
-    teacher.register_forward_pre_hook(observe_teacher, with_kwargs=True)
+    teacher.get_decoder().register_forward_pre_hook(observe_teacher, with_kwargs=True)
 
 
 original_compute_loss = trainer.compute_loss
@@ -342,8 +409,8 @@ def measured_compute_loss(model, inputs, *args, **kwargs):
     if monitor.current is not None:
         monitor.current.update(
             loss=loss.item(),
-            teacher_id=int(inputs["teacher_id"].item()),
-            sample_id=int(inputs["sample_id"].item()),
+            teacher_id=inputs["teacher_id"].tolist(),
+            sample_id=inputs["sample_id"].tolist(),
             tokens=int((inputs["labels"][:, 1:] != -100).sum()),
         )
     return output

@@ -51,6 +51,58 @@ if is_peft_available():
 logger = get_logger(__name__)
 
 
+class _ChunkedDistillationLoss(torch.autograd.Function):
+    """Summed per-token divergence through the student LM head, one token chunk at a time.
+
+    Full-vocabulary logits exist for only one chunk at a time. Each chunk's gradients with respect to the student
+    hidden states and the LM-head weight are computed during the forward pass and replayed in backward, so the
+    teacher may leave the device before backward runs.
+    """
+
+    @staticmethod
+    def forward(ctx, student_hidden, weight, bias, teacher_hidden, teacher_head, chunk_size, divergence):
+        grad_hidden = torch.empty_like(student_hidden)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+        grad_bias = None if bias is None else torch.zeros_like(bias, dtype=torch.float32)
+        total = torch.zeros((), dtype=torch.float32, device=student_hidden.device)
+        for start in range(0, student_hidden.shape[0], chunk_size):
+            end = start + chunk_size
+            hidden = student_hidden[start:end].detach().requires_grad_()
+            chunk_weight = weight.detach().requires_grad_()
+            chunk_bias = None if bias is None else bias.detach().requires_grad_()
+            with torch.no_grad():
+                teacher_logits = teacher_head(teacher_hidden[start:end]).float()
+            with torch.enable_grad():
+                student_logits = F.linear(hidden, chunk_weight, chunk_bias).float()
+                loss = divergence(student_logits, teacher_logits)
+                leaves = (hidden, chunk_weight) if chunk_bias is None else (hidden, chunk_weight, chunk_bias)
+                grads = torch.autograd.grad(loss, leaves)
+            grad_hidden[start:end] = grads[0]
+            grad_weight += grads[1]
+            if chunk_bias is not None:
+                grad_bias += grads[2]
+            total += loss.detach()
+            del student_logits, teacher_logits, loss, grads
+        ctx.has_bias = bias is not None
+        ctx.weight_dtype = weight.dtype
+        ctx.save_for_backward(grad_hidden, grad_weight, *(() if grad_bias is None else (grad_bias,)))
+        return total
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_hidden, grad_weight, *rest = ctx.saved_tensors
+        grad_bias = (rest[0] * grad_output).to(ctx.weight_dtype) if ctx.has_bias else None
+        return (
+            grad_hidden * grad_output.to(grad_hidden.dtype),
+            (grad_weight * grad_output).to(ctx.weight_dtype),
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _DataCollatorForMOPD(DataCollatorForChatML):
     def __call__(self, examples):
         if any("teacher_id" not in example or type(example["teacher_id"]) is not int for example in examples):
@@ -101,8 +153,13 @@ class GKDTrainer(SFTTrainer):
         teacher_models (`dict[int, PreTrainedModel or str]`, *optional*):
             Frozen domain teachers for multi-teacher on-policy distillation (MOPD). Each example's integer
             `teacher_id` selects one teacher. Mutually exclusive with `teacher_model`. Requires one device,
-            batch size 1, `lmbda=1.0`, and `seq_kd=False`. Teachers are stored on CPU; only the selected teacher
-            is moved to the training device. Custom collators must preserve `teacher_id` as an integer tensor.
+            `lmbda=1.0`, and `seq_kd=False`. A batch may mix teachers: it is split by `teacher_id`, each part is
+            scored by its teacher, and the loss is the token mean over the whole batch. Teachers are stored on CPU;
+            only the selected teacher is moved to the training device. Custom collators must preserve `teacher_id`
+            as an integer tensor.
+        loss_chunk_size (`int`, *optional*):
+            MOPD only. When set, compute the divergence over this many completion tokens at a time from the final
+            hidden states instead of materializing full-vocabulary logits for the whole batch.
     """
 
     _tag_names = ["trl", "gkd"]
@@ -142,12 +199,15 @@ class GKDTrainer(SFTTrainer):
         peft_config: "PeftConfig | None" = None,
         formatting_func: Callable | None = None,
         teacher_models: dict[int, PreTrainedModel | nn.Module | str] | None = None,
+        loss_chunk_size: int | None = None,
     ):
         if teacher_models is not None:
             if teacher_model is not None or not teacher_models or any(type(key) is not int for key in teacher_models):
                 raise ValueError("Pass a nonempty integer-keyed teacher_models mapping instead of teacher_model.")
-            if args.lmbda != 1.0 or args.seq_kd or args.per_device_train_batch_size != 1:
-                raise ValueError("MOPD requires lmbda=1.0, seq_kd=False, and per_device_train_batch_size=1.")
+            if args.lmbda != 1.0 or args.seq_kd:
+                raise ValueError("MOPD requires lmbda=1.0 and seq_kd=False.")
+        if loss_chunk_size is not None and (teacher_models is None or loss_chunk_size <= 0):
+            raise ValueError("loss_chunk_size must be a positive integer and requires teacher_models.")
 
         # Ensure Trainer does not drop non-signature columns used by the collator (e.g., "prompts")
         args.remove_unused_columns = False
@@ -180,6 +240,7 @@ class GKDTrainer(SFTTrainer):
 
         self.teacher_models = None
         self._active_teacher_id = None
+        self.loss_chunk_size = loss_chunk_size
         if teacher_models is not None:
             if (
                 self.accelerator.num_processes != 1
@@ -384,22 +445,9 @@ class GKDTrainer(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.teacher_models is not None:
-            teacher_ids = inputs.get("teacher_id")
-            if (
-                not isinstance(teacher_ids, torch.Tensor)
-                or teacher_ids.dtype != torch.long
-                or teacher_ids.numel() != 1
-                or inputs["input_ids"].shape[0] != 1
-            ):
-                raise ValueError("MOPD requires batch size 1 and one torch.long teacher_id per batch.")
-            teacher_id = teacher_ids.item()
-            if teacher_id not in self.teacher_models:
-                raise ValueError(f"Unknown teacher_id {teacher_id}; expected one of {list(self.teacher_models)}.")
-            if teacher_id != self._active_teacher_id:
-                if self.teacher_model is not None:
-                    self.teacher_model.to("cpu")
-                self.teacher_model = self.teacher_models[teacher_id].to(self.accelerator.device)
-                self._active_teacher_id = teacher_id
+            loss, student_outputs = self._compute_mopd_loss(model, inputs, num_items_in_batch)
+            empty_cache()
+            return (loss, student_outputs) if return_outputs else loss
 
         # compute student output
         student_outputs = model(
@@ -433,15 +481,98 @@ class GKDTrainer(SFTTrainer):
             num_items_in_batch=num_items_in_batch,
         )
 
-        if self.teacher_models is not None:
-            mode = "train" if self.model.training else "eval"
-            self._metrics[mode][f"teacher/{teacher_id}/loss"].append(loss.detach().item())
-
         # empty cache
         empty_cache()
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
+
+    def _select_teacher(self, teacher_id):
+        if teacher_id not in self.teacher_models:
+            raise ValueError(f"Unknown teacher_id {teacher_id}; expected one of {list(self.teacher_models)}.")
+        if teacher_id != self._active_teacher_id:
+            if self.teacher_model is not None:
+                self.teacher_model.to("cpu")
+            self.teacher_model = self.teacher_models[teacher_id].to(self.accelerator.device)
+            self._active_teacher_id = teacher_id
+        return self.teacher_model
+
+    def _compute_mopd_loss(self, model, inputs, num_items_in_batch):
+        teacher_ids = inputs.get("teacher_id")
+        batch_size = inputs["input_ids"].shape[0]
+        if (
+            not isinstance(teacher_ids, torch.Tensor)
+            or teacher_ids.dtype != torch.long
+            or teacher_ids.numel() != batch_size
+        ):
+            raise ValueError("MOPD requires one torch.long teacher_id per example.")
+        teacher_ids = teacher_ids.view(-1).cpu()
+        shifted_labels = inputs["labels"][:, 1:]
+        total_tokens = (shifted_labels != -100).sum()
+        # The resident teacher goes first, so a mixed batch needs one transfer fewer.
+        order = sorted(set(teacher_ids.tolist()), key=lambda i: (i != self._active_teacher_id, i))
+        mode = "train" if self.model.training else "eval"
+        loss_sum = None
+        student_outputs = None
+        for teacher_id in order:
+            rows = (teacher_ids == teacher_id).nonzero().view(-1).to(inputs["input_ids"].device)
+            input_ids = inputs["input_ids"][rows]
+            attention_mask = inputs["attention_mask"][rows]
+            labels = shifted_labels[rows]
+            teacher = self._select_teacher(teacher_id)
+            teacher.eval()
+            if self.loss_chunk_size is None:
+                student_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                with torch.no_grad():
+                    teacher_outputs = teacher(input_ids=input_ids, attention_mask=attention_mask)
+                part = self.generalized_jsd_loss(
+                    student_logits=student_outputs.logits[:, :-1, :],
+                    teacher_logits=teacher_outputs.logits[:, :-1, :],
+                    labels=labels,
+                    beta=self.beta,
+                    reduction="sum",
+                )
+                del teacher_outputs
+            else:
+                part = self._chunked_loss_sum(model, teacher, input_ids, attention_mask, labels)
+            count = int((labels != -100).sum())
+            self._metrics[mode][f"teacher/{teacher_id}/loss"].append(part.detach().item() / max(count, 1))
+            loss_sum = part if loss_sum is None else loss_sum + part
+        if num_items_in_batch is not None:
+            if isinstance(num_items_in_batch, torch.Tensor):
+                num_items_in_batch = num_items_in_batch.to(loss_sum.device)
+            return loss_sum / num_items_in_batch, student_outputs
+        # Same token mean as the dense loss; clamp_min(1) keeps an all-masked batch at zero instead of NaN.
+        return loss_sum / total_tokens.clamp_min(1), student_outputs
+
+    def _chunked_loss_sum(self, model, teacher, input_ids, attention_mask, labels):
+        student = self.accelerator.unwrap_model(model)
+        valid = labels != -100
+        with self.accelerator.autocast():
+            student_hidden = student.get_decoder()(
+                input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+            ).last_hidden_state[:, :-1][valid]
+            with torch.no_grad():
+                teacher_hidden = teacher.get_decoder()(
+                    input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+                ).last_hidden_state[:, :-1][valid]
+        head = student.get_output_embeddings()
+        beta = self.beta
+
+        def divergence(student_logits, teacher_logits):
+            return self.generalized_jsd_loss(
+                student_logits.unsqueeze(0), teacher_logits.unsqueeze(0), beta=beta, reduction="sum"
+            )
+
+        return _ChunkedDistillationLoss.apply(
+            student_hidden,
+            head.weight,
+            head.bias,
+            teacher_hidden,
+            teacher.get_output_embeddings(),
+            self.loss_chunk_size,
+            divergence,
+        )
 
     @staticmethod
     def generate_on_policy_outputs(model, inputs, generation_config):
